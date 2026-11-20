@@ -411,6 +411,36 @@ sys.exit(0)'
 fi
 
 echo "--- Host resolver through axis run ---"
+# Diagnostic only (not a check): how name resolution behaves on this host and
+# in a native allow-mode sandbox. Never changes PASS/FAIL counts.
+diag_probe="$(cat "${SCRIPT_DIR}/diag_resolver_probe.py")"
+if command -v python3 >/dev/null 2>&1; then
+    echo "DIAG kernel: $(uname -r)"
+    python3 -c "$diag_probe" host 2>&1 || true
+    diag_policy="$(write_policy allow "" "" axis_native)"
+    diag_dir="$(new_tmpdir)"
+    (
+        cd "$diag_dir"
+        timeout 60 "$AXIS" --socket "/tmp/axis-e2e-diag-$$.sock" run --policy "$diag_policy" \
+            -- python3 -c "$diag_probe" sandbox
+    ) 2>&1 | grep -E "^DIAG|Traceback|Error|landlock: ABI|admitted|stays denied|granted" || true
+    if command -v strace >/dev/null 2>&1; then
+        diag_trace="${diag_dir}/strace.txt"
+        (
+            cd "$diag_dir"
+            timeout 60 strace -f -qq -s 64 -e trace=socket,connect,sendmmsg,sendto,sendmsg,recvfrom,recvmsg,openat \
+                -o "$diag_trace" "$AXIS" --socket "/tmp/axis-e2e-diag-$$-s.sock" run --policy "$diag_policy" \
+                -- python3 -c 'import socket
+try: print("DIAG strace getaddrinfo pypi.org:", socket.getaddrinfo("pypi.org", 443)[0][4][0])
+except OSError as exc: print("DIAG strace getaddrinfo pypi.org:", exc)'
+        ) 2>&1 | grep "^DIAG" || true
+        echo "DIAG strace: $(wc -l <"$diag_trace" 2>&1) lines; resolver-related lines:"
+        grep -E "nsswitch|resolv|libnss|io.systemd.Resolve|htons\(53\)|sendmmsg|EPERM|EACCES" "$diag_trace" 2>/dev/null \
+            | grep -v "ENOENT" | cut -c1-300 | head -60 | sed "s/^/DIAG strace| /" || true
+    else
+        echo "DIAG strace: not installed"
+    fi
+fi
 resolver_socket=/run/systemd/resolve/io.systemd.Resolve
 if ! [ -S "$resolver_socket" ]; then
     skip "host resolver checks need systemd-resolved ($resolver_socket is not a socket)"
